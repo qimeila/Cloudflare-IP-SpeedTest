@@ -4,11 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/csv"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
@@ -24,8 +22,8 @@ import (
 
 const (
 	requestURL  = "speed.cloudflare.com/cdn-cgi/trace" // 请求trace URL
-	timeout     = 1 * time.Second                      // 超时时间
-	maxDuration = 2 * time.Second                      // 最大持续时间
+	timeout     = 5 * time.Second                      // 超时时间
+	maxDuration = 5 * time.Second                      // 最大持续时间
 )
 
 var (
@@ -41,9 +39,6 @@ var (
 type result struct {
 	ip          string        // IP地址
 	port        int           // 端口
-	dataCenter  string        // 数据中心
-	region      string        // 地区
-	city        string        // 城市
 	latency     string        // 延迟
 	tcpDuration time.Duration // TCP请求延迟
 }
@@ -51,15 +46,6 @@ type result struct {
 type speedtestresult struct {
 	result
 	downloadSpeed float64 // 下载速度
-}
-
-type location struct {
-	Iata   string  `json:"iata"`
-	Lat    float64 `json:"lat"`
-	Lon    float64 `json:"lon"`
-	Cca2   string  `json:"cca2"`
-	Region string  `json:"region"`
-	City   string  `json:"city"`
 }
 
 // 尝试提升文件描述符的上限
@@ -81,67 +67,6 @@ func main() {
 	osType := runtime.GOOS
 	if osType == "linux" {
 		increaseMaxOpenFiles()
-	}
-
-	var locations []location
-	if _, err := os.Stat("locations.json"); os.IsNotExist(err) {
-		fmt.Println("本地 locations.json 不存在\n正在从 https://speed.cloudflare.com/locations 下载 locations.json")
-		resp, err := http.Get("https://speed.cloudflare.com/locations")
-		if err != nil {
-			fmt.Printf("无法从URL中获取JSON: %v\n", err)
-			return
-		}
-
-		defer resp.Body.Close()
-
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			fmt.Printf("无法读取响应体: %v\n", err)
-			return
-		}
-
-		err = json.Unmarshal(body, &locations)
-		if err != nil {
-			fmt.Printf("无法解析JSON: %v\n", err)
-			return
-		}
-		file, err := os.Create("locations.json")
-		if err != nil {
-			fmt.Printf("无法创建文件: %v\n", err)
-			return
-		}
-		defer file.Close()
-
-		_, err = file.Write(body)
-		if err != nil {
-			fmt.Printf("无法写入文件: %v\n", err)
-			return
-		}
-	} else {
-		fmt.Println("本地 locations.json 已存在,无需重新下载")
-		file, err := os.Open("locations.json")
-		if err != nil {
-			fmt.Printf("无法打开文件: %v\n", err)
-			return
-		}
-		defer file.Close()
-
-		body, err := ioutil.ReadAll(file)
-		if err != nil {
-			fmt.Printf("无法读取文件: %v\n", err)
-			return
-		}
-
-		err = json.Unmarshal(body, &locations)
-		if err != nil {
-			fmt.Printf("无法解析JSON: %v\n", err)
-			return
-		}
-	}
-
-	locationMap := make(map[string]location)
-	for _, loc := range locations {
-		locationMap[loc.Iata] = loc
 	}
 
 	ips, err := readIPs(*File)
@@ -179,7 +104,15 @@ func main() {
 				KeepAlive: 0,
 			}
 			start := time.Now()
-			conn, err := dialer.Dial("tcp", net.JoinHostPort(ip, strconv.Itoa(*defaultPort)))
+
+			var conn net.Conn
+			var err error
+			if strings.Contains(ip, ":") {
+				conn, err = dialer.Dial("tcp", ip)
+			} else {
+				conn, err = dialer.Dial("tcp", net.JoinHostPort(ip, strconv.Itoa(*defaultPort)))
+			}
+
 			if err != nil {
 				return
 			}
@@ -245,18 +178,18 @@ func main() {
 			if err != nil {
 				return
 			}
+			bodystring := body.String()
 
-			if strings.Contains(body.String(), "uag=Mozilla/5.0") {
+			if strings.Contains(bodystring, "uag=Mozilla/5.0") {
 				if matches := regexp.MustCompile(`colo=([A-Z]+)`).FindStringSubmatch(body.String()); len(matches) > 1 {
-					dataCenter := matches[1]
-					loc, ok := locationMap[dataCenter]
-					if ok {
-						fmt.Printf("发现有效IP %s 位置信息 %s 延迟 %d 毫秒\n", ip, loc.City, tcpDuration.Milliseconds())
-						resultChan <- result{ip, *defaultPort, dataCenter, loc.Region, loc.City, fmt.Sprintf("%d ms", tcpDuration.Milliseconds()), tcpDuration}
-					} else {
-						fmt.Printf("发现有效IP %s 位置信息未知 延迟 %d 毫秒\n", ip, tcpDuration.Milliseconds())
-						resultChan <- result{ip, *defaultPort, dataCenter, "", "", fmt.Sprintf("%d ms", tcpDuration.Milliseconds()), tcpDuration}
+
+					fmt.Printf("发现有效IP %s 延迟 %d 毫秒\n", ip, tcpDuration.Milliseconds())
+					realPort := *defaultPort
+					if strings.Contains(ip, ":") {
+						realPort, _ = strconv.Atoi(strings.Split(ip, ":")[1])
 					}
+					resultChan <- result{ip, realPort, fmt.Sprintf("%d ms", tcpDuration.Milliseconds()), tcpDuration}
+
 				}
 			}
 		}(ip)
@@ -326,15 +259,15 @@ func main() {
 
 	writer := csv.NewWriter(file)
 	if *speedTest > 0 {
-		writer.Write([]string{"IP地址", "端口", "TLS", "数据中心", "地区", "城市", "网络延迟", "下载速度"})
+		writer.Write([]string{"IP地址", "端口", "TLS", "网络延迟", "下载速度"})
 	} else {
-		writer.Write([]string{"IP地址", "端口", "TLS", "数据中心", "地区", "城市", "网络延迟"})
+		writer.Write([]string{"IP地址", "端口", "TLS", "网络延迟"})
 	}
 	for _, res := range results {
 		if *speedTest > 0 {
-			writer.Write([]string{res.result.ip, strconv.Itoa(res.result.port), strconv.FormatBool(*enableTLS), res.result.dataCenter, res.result.region, res.result.city, res.result.latency, fmt.Sprintf("%.0f kB/s", res.downloadSpeed)})
+			writer.Write([]string{res.result.ip, strconv.Itoa(res.result.port), strconv.FormatBool(*enableTLS), res.result.latency, fmt.Sprintf("%.0f kB/s", res.downloadSpeed)})
 		} else {
-			writer.Write([]string{res.result.ip, strconv.Itoa(res.result.port), strconv.FormatBool(*enableTLS), res.result.dataCenter, res.result.region, res.result.city, res.result.latency})
+			writer.Write([]string{res.result.ip, strconv.Itoa(res.result.port), strconv.FormatBool(*enableTLS), res.result.latency})
 		}
 	}
 
@@ -400,7 +333,13 @@ func getDownloadSpeed(ip string) float64 {
 		Timeout:   timeout,
 		KeepAlive: 0,
 	}
-	conn, err := dialer.Dial("tcp", net.JoinHostPort(ip, strconv.Itoa(*defaultPort)))
+	var conn net.Conn
+	var err error
+	if strings.Contains(ip, ":") {
+		conn, err = dialer.Dial("tcp", ip)
+	} else {
+		conn, err = dialer.Dial("tcp", net.JoinHostPort(ip, strconv.Itoa(*defaultPort)))
+	}
 	if err != nil {
 		return 0
 	}
@@ -416,7 +355,7 @@ func getDownloadSpeed(ip string) float64 {
 			},
 		},
 		//设置单个IP测速最长时间为5秒
-		Timeout: 5 * time.Second,
+		Timeout: 10 * time.Second,
 	}
 	// 发送请求
 	req.Close = true
